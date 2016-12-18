@@ -4,10 +4,10 @@ const lodash = require('lodash');
 const Promise = require('bluebird');
 
 const envName = process.env.NODE_ENV || 'production';
-const config = require(process.env.configFile || '../config/' + envName);
+const config = require(process.env.configFile || `/h/private-config/scraperbot/${envName}`);
 const state = {};
 const redis = require('redis');
-const client = Promise.promisifyAll(redis.createClient());
+const client = Promise.promisifyAll(redis.createClient(config.telebotRedis));
 
 const logger = require('winston');
 logger.level = config.loggerLevel || 'info';
@@ -45,8 +45,8 @@ async function start() {
     state.started = Math.floor(Date.now()/1000);
     state.pid = process.pid;
     state.instanceId = await client.incrAsync(`${config.namespace}:instance:seq`);
-    logger.info('start', {config, state, queue});
     const instanceKey = `${config.namespace}:instance:${state.instanceId}:h`;
+    logger.info('start', {config, state, instanceKey});
     await multiExecAsync(client, multi => {
         ['started', 'pid'].forEach(property => {
             multi.hset(instanceKey, property, state[property]);
@@ -54,17 +54,43 @@ async function start() {
         multi.expire(instanceKey, config.processExpire);
     });
     if (process.env.NODE_ENV === 'development') {
-        await startDevelopment();
+        //await startDevelopment();
     } else if (process.env.NODE_ENV === 'test') {
         return startTest();
     } else {
     }
-    while (true) {
-        let id = await client.brpoplpushAsync(queue.req, queue.busy, config.popTimeout);
-        if (!id) {
+    client.on('message', (channel, message) => {
+        handle(JSON.parse(message));
+    });
+    client.subscribe('telebot:' + config.secret);
+}
+
+async function handle(message) {
+    logger.debug('handle', message.message.text, message.message.chat.id, message.message.from.username, JSON.stringify(message, null, 2));
+    return sendTelegram(message.message.chat.id, 'text', `Thanks ${message.message.from.username} (${message.message.text})`);
+}
+
+async function sendTelegram(chatId, format, ...content) {
+    logger.debug('sendTelegram', chatId, format, content);
+    try {
+        const text = lodash.trim(lodash.flatten(content).join(' '));
+        assert(chatId, 'chatId');
+        let uri = `sendMessage?chat_id=${chatId}`;
+        uri += '&disable_notification=true';
+        if (format === 'markdown') {
+            uri += `&parse_mode=Markdown`;
+        } else if (format === 'html') {
+            uri += `&parse_mode=HTML`;
         }
+        uri += `&text=${encodeURIComponent(text)}`;
+        const url = `https://api.telegram.org/bot${config.token}/${uri}`;
+        const res = await fetch(url);
+        if (res.status !== 200) {
+            logger.warn('sendTelegram', chatId, url);
+        }
+    } catch (err) {
+        logger.error('sendTelegram', err);
     }
-    return end();
 }
 
 async function startTest() {
@@ -97,6 +123,6 @@ start().then(() => {
     logger.info('started');
 }).catch(err => {
     logger.error(err);
-    end();
+    return end();
 }).finally(() => {
 });
